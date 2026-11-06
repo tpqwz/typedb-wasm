@@ -1,0 +1,522 @@
+/*
+* This Source Code Form is subject to the terms of the Mozilla Public
+* License, v. 2.0. If a copy of the MPL was not distributed with this
+* file, You can obtain one at https://mozilla.org/MPL/2.0/.
+*/
+use std::collections::HashSet;
+
+use answer::variable::Variable;
+use error::UnimplementedFeature;
+use typeql::{
+    Expression, Pattern, Statement, TypeRef,
+    common::Spanned,
+    query::stage::{
+        Put,
+        delete::{Deletable, DeletableKind},
+        write_pattern::{WriteCondition, WritePattern, WritePatternIf},
+    },
+    statement::thing::{Constraint, HasValue, Head, RolePlayer},
+};
+
+use crate::{
+    RepresentationError,
+    pattern::conjunction::ConjunctionBuilderWithContext,
+    pipeline::{
+        ParameterRegistry,
+        block::Block,
+        function_signature::{FunctionSignatureIndex, HashMapFunctionSignatureIndex},
+    },
+    translation::{
+        PipelineTranslationContext,
+        constraints::{add_statement, add_typeql_isa, add_typeql_relation, register_typeql_var},
+        match_::add_optional,
+        verify_variable_available,
+    },
+};
+
+pub fn translate_insert(
+    context: &mut PipelineTranslationContext,
+    value_parameters: &mut ParameterRegistry,
+    insert: &typeql::query::stage::Insert,
+) -> Result<Block, Box<RepresentationError>> {
+    validate_insert_patterns(context, &insert.patterns)?;
+    let mut builder = Block::builder(context.new_block_builder_context_for_writes(value_parameters));
+    let function_index = HashMapFunctionSignatureIndex::empty();
+    let mut conjunction = builder.conjunction_mut();
+    add_write_patterns(&function_index, &mut conjunction, &insert.patterns)?;
+    builder.finish()
+}
+
+fn validate_insert_patterns(
+    context: &PipelineTranslationContext,
+    insert_patterns: &[WritePattern],
+) -> Result<(), Box<RepresentationError>> {
+    for pattern in insert_patterns {
+        validate_insert_pattern(context, pattern)?;
+    }
+    Ok(())
+}
+
+fn validate_insert_pattern(
+    context: &PipelineTranslationContext,
+    pattern: &WritePattern,
+) -> Result<(), Box<RepresentationError>> {
+    match pattern {
+        WritePattern::Optional(typeql::pattern::Optional { patterns, .. }) => {
+            for pattern in patterns {
+                match pattern {
+                    Pattern::Optional(_) => {
+                        return Err(Box::new(RepresentationError::UnimplementedLanguageFeature {
+                            feature: UnimplementedFeature::NestedOptionalWrites,
+                        }));
+                    }
+                    Pattern::Conjunction(typeql::pattern::Conjunction { span, .. })
+                    | Pattern::Disjunction(typeql::pattern::Disjunction { span, .. })
+                    | Pattern::Negation(typeql::pattern::Negation { span, .. }) => {
+                        return Err(Box::new(RepresentationError::IllegalNestedPatternForInsert {
+                            source_span: *span,
+                        }));
+                    }
+                    Pattern::Statement(statement) => validate_insert_statement(context, statement)?,
+                }
+            }
+        }
+        WritePattern::If(WritePatternIf { conditions, then, .. }) => {
+            validate_if_conditions(context, conditions)?;
+            validate_insert_patterns(context, then)?;
+        }
+        WritePattern::Statement(statement) => validate_insert_statement(context, statement)?,
+    }
+    Ok(())
+}
+
+fn validate_insert_statement(
+    context: &PipelineTranslationContext,
+    statement: &Statement,
+) -> Result<(), Box<RepresentationError>> {
+    match statement {
+        Statement::Thing(thing_stmt) => {
+            for constraint in &thing_stmt.constraints {
+                match constraint {
+                    Constraint::Iid(_) => {
+                        return Err(Box::new(RepresentationError::IllegalStatementForInsert {
+                            source_span: thing_stmt.span(),
+                        }));
+                    }
+                    Constraint::Isa(_) | Constraint::Has(_) | Constraint::Links(_) => (),
+                }
+            }
+            Ok(())
+        }
+        other => Err(Box::new(RepresentationError::IllegalStatementForInsert { source_span: other.span() })),
+    }
+}
+
+fn validate_if_conditions(
+    context: &PipelineTranslationContext,
+    conditions: &[WriteCondition],
+) -> Result<(), Box<RepresentationError>> {
+    for condition in conditions {
+        match condition {
+            WriteCondition::Isa { variable, isa, .. } => {
+                verify_variable_available!(context, variable => IfConditionVariableUnavailable)?;
+                if let TypeRef::Variable(type_) = &isa.type_ {
+                    verify_variable_available!(context, type_ => IfConditionVariableUnavailable)?;
+                }
+            }
+            WriteCondition::Comparison(comparison) => {
+                validate_write_stage_expression_variables_availability(context, &comparison.lhs)?;
+                validate_write_stage_expression_variables_availability(context, &comparison.comparison.rhs)?;
+            }
+            WriteCondition::IsSet(is_set) => {
+                for variable in &is_set.variables {
+                    verify_variable_available!(context, variable => IfConditionVariableUnavailable)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn add_write_patterns(
+    function_index: &impl FunctionSignatureIndex,
+    conjunction: &mut ConjunctionBuilderWithContext<'_, '_>,
+    patterns: &[WritePattern],
+) -> Result<(), Box<RepresentationError>> {
+    for pattern in patterns {
+        match pattern {
+            WritePattern::Statement(statement) => add_statement(function_index, conjunction, statement)?,
+            WritePattern::Optional(optional) => {
+                error::optional_usage_error!(RepresentationError::IllegalTryInWriteStage {
+                    source_span: optional.span
+                });
+                add_optional(function_index, conjunction, optional)?
+            }
+            WritePattern::If(if_statement) => {
+                let mut optional_builder = conjunction.add_optional(if_statement.span)?;
+                for condition in &if_statement.conditions {
+                    add_write_condition(function_index, &mut optional_builder, condition)?;
+                }
+                add_write_patterns(function_index, &mut optional_builder, &if_statement.then)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn add_write_condition(
+    function_index: &impl FunctionSignatureIndex,
+    conjunction: &mut ConjunctionBuilderWithContext<'_, '_>,
+    condition: &WriteCondition,
+) -> Result<(), Box<RepresentationError>> {
+    match condition {
+        WriteCondition::IsSet(isset) => {
+            let mut constraints = conjunction.constraints_mut();
+            let variables = isset
+                .variables
+                .iter()
+                .map(|v| register_typeql_var(&mut constraints, v))
+                .collect::<Result<Vec<_>, _>>()?;
+            constraints.add_is_set(variables, isset.span())?;
+        }
+        WriteCondition::Comparison(cmp) => {
+            add_statement(function_index, conjunction, &typeql::Statement::Comparison(cmp.clone()))?;
+            return Err(Box::new(RepresentationError::UnimplementedLanguageFeature {
+                feature: UnimplementedFeature::ComparisonInIfStatements,
+            }));
+        }
+        WriteCondition::Isa { variable, isa } => {
+            let mut constraints = conjunction.constraints_mut();
+            let ir_var = register_typeql_var(&mut constraints, variable)?;
+            add_typeql_isa(function_index, &mut constraints, ir_var, isa)?;
+            return Err(Box::new(RepresentationError::UnimplementedLanguageFeature {
+                feature: UnimplementedFeature::IsaInIfStatements,
+            }));
+        }
+    }
+    Ok(())
+}
+
+pub fn translate_update(
+    context: &mut PipelineTranslationContext,
+    value_parameters: &mut ParameterRegistry,
+    update: &typeql::query::stage::Update,
+) -> Result<Block, Box<RepresentationError>> {
+    validate_update_patterns(context, &update.patterns)?;
+    let mut builder = Block::builder(context.new_block_builder_context_for_writes(value_parameters));
+    let function_index = HashMapFunctionSignatureIndex::empty();
+    let mut conjunction = builder.conjunction_mut();
+    add_write_patterns(&function_index, &mut conjunction, &update.patterns)?;
+    builder.finish()
+}
+
+pub fn translate_put(
+    context: &mut PipelineTranslationContext,
+    value_parameters: &mut ParameterRegistry,
+    put: &Put,
+) -> Result<Block, Box<RepresentationError>> {
+    validate_insert_patterns(context, &put.patterns)?;
+    let mut builder = Block::builder(context.new_block_builder_context_for_writes(value_parameters));
+    let function_index = HashMapFunctionSignatureIndex::empty();
+    let mut conjunction = builder.conjunction_mut();
+    add_write_patterns(&function_index, &mut conjunction, &put.patterns)?;
+    let block = builder.finish()?;
+    for constraint in block.conjunction().constraints() {
+        match constraint {
+            crate::pattern::constraint::Constraint::RoleName(_)
+            | crate::pattern::constraint::Constraint::Isa(_)
+            | crate::pattern::constraint::Constraint::Links(_)
+            | crate::pattern::constraint::Constraint::Has(_)
+            | crate::pattern::constraint::Constraint::Comparison(_)
+            | crate::pattern::constraint::Constraint::LinksDeduplication(_)
+            | crate::pattern::constraint::Constraint::IsSet(_) => (),
+            constraint => {
+                return Err(Box::new(RepresentationError::IllegalStatementForPut {
+                    constraint_type: constraint.name().to_owned(),
+                    source_span: constraint.source_span(),
+                }));
+            }
+        }
+    }
+    Ok(block)
+}
+
+pub fn translate_delete(
+    context: &mut PipelineTranslationContext,
+    value_parameters: &mut ParameterRegistry,
+    delete: &typeql::query::stage::Delete,
+) -> Result<Block, Box<RepresentationError>> {
+    validate_delete(delete)?;
+    validate_deleted_variables_availability(context, delete)?;
+    let mut builder = Block::builder(context.new_block_builder_context_for_writes(value_parameters));
+    let mut deleted_concepts = HashSet::new();
+    let mut conjunction = builder.conjunction_mut();
+    let function_index = HashMapFunctionSignatureIndex::empty();
+    add_deletables(&function_index, &delete.deletables, &mut conjunction, &mut deleted_concepts)?;
+    let block = builder.finish()?;
+    context.last_stage_visible_variables.retain(|_name, var| !deleted_concepts.contains(var));
+    Ok(block)
+}
+
+fn validate_delete(delete: &typeql::query::stage::Delete) -> Result<(), Box<RepresentationError>> {
+    for deletable in &delete.deletables {
+        match &deletable.kind {
+            DeletableKind::Optional { deletables } => {
+                if deletables
+                    .iter()
+                    .any(|d| matches!(d.kind, DeletableKind::Optional { .. } | DeletableKind::If { .. }))
+                {
+                    return Err(Box::new(RepresentationError::UnimplementedLanguageFeature {
+                        feature: UnimplementedFeature::NestedOptionalWrites,
+                    }));
+                }
+            }
+            DeletableKind::If { deletables, .. } => {
+                // Allows if in if
+                if deletables.iter().any(|d| matches!(d.kind, DeletableKind::Optional { .. })) {
+                    return Err(Box::new(RepresentationError::UnimplementedLanguageFeature {
+                        feature: UnimplementedFeature::NestedOptionalWrites,
+                    }));
+                }
+            }
+            _ => (),
+        }
+    }
+    Ok(())
+}
+
+fn add_deletables(
+    function_index: &impl FunctionSignatureIndex,
+    deletables: &[Deletable],
+    conjunction: &mut ConjunctionBuilderWithContext<'_, '_>,
+    deleted_concepts_recursive: &mut HashSet<Variable>,
+) -> Result<(), Box<RepresentationError>> {
+    for deletable in deletables {
+        match &deletable.kind {
+            DeletableKind::Has { attribute, owner } => {
+                let mut constraints = conjunction.constraints_mut();
+                let translated_owner = register_typeql_var(&mut constraints, owner)?;
+                let translated_attribute = register_typeql_var(&mut constraints, attribute)?;
+                constraints.add_has(translated_owner, translated_attribute, deletable.span())?;
+            }
+            DeletableKind::Links { players, relation } => {
+                let mut constraints = conjunction.constraints_mut();
+                let translated_relation = register_typeql_var(&mut constraints, relation)?;
+                add_typeql_relation(&mut constraints, translated_relation, players)?;
+            }
+            DeletableKind::Concept { variable } => {
+                let mut constraints = conjunction.constraints_mut();
+                let translated_variable =
+                    constraints.get_or_declare_variable(variable.name().unwrap(), variable.span())?;
+                conjunction.constraints_mut().add_delete_concepts(vec![translated_variable], deletable.span());
+                deleted_concepts_recursive.insert(translated_variable);
+            }
+            DeletableKind::Optional { deletables } => {
+                debug_assert!(
+                    deletables
+                        .iter()
+                        .all(|d| !matches!(d.kind, DeletableKind::Optional { .. } | DeletableKind::If { .. }))
+                );
+                let mut optional_builder = conjunction.add_optional(deletable.span())?;
+                add_deletables(function_index, deletables, &mut optional_builder, deleted_concepts_recursive)?;
+            }
+            DeletableKind::If { conditions, deletables } => {
+                debug_assert!(deletables.iter().all(|d| !matches!(d.kind, DeletableKind::Optional { .. })));
+                let mut optional_builder = conjunction.add_optional(deletable.span())?;
+                for condition in conditions {
+                    add_write_condition(function_index, &mut optional_builder, condition)?;
+                }
+                add_deletables(function_index, deletables, &mut optional_builder, deleted_concepts_recursive)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_update_patterns(
+    context: &mut PipelineTranslationContext,
+    update_patterns: &[WritePattern],
+) -> Result<(), Box<RepresentationError>> {
+    for pattern in update_patterns {
+        validate_update_pattern(context, pattern)?;
+    }
+    Ok(())
+}
+
+fn validate_update_pattern(
+    context: &mut PipelineTranslationContext,
+    pattern: &WritePattern,
+) -> Result<(), Box<RepresentationError>> {
+    match pattern {
+        WritePattern::Optional(typeql::pattern::Optional { patterns, .. }) => {
+            for pattern in patterns {
+                if let typeql::Pattern::Optional(_) = pattern {
+                    return Err(Box::new(RepresentationError::UnimplementedLanguageFeature {
+                        feature: UnimplementedFeature::NestedOptionalWrites,
+                    }));
+                }
+            }
+        }
+        WritePattern::If(WritePatternIf { conditions, then, .. }) => {
+            validate_if_conditions(context, conditions)?;
+            validate_update_patterns(context, then)?;
+        }
+        WritePattern::Statement(statement) => validate_update_statement(context, statement)?,
+    }
+    Ok(())
+}
+
+fn validate_update_statement(
+    context: &mut PipelineTranslationContext,
+    statement: &Statement,
+) -> Result<(), Box<RepresentationError>> {
+    if let Statement::Thing(thing_statement) = statement {
+        match &thing_statement.head {
+            Head::Variable(variable) => {
+                verify_variable_available!(context, variable => UpdateVariableUnavailable)?;
+            }
+            Head::Relation(_, relation) => {
+                return Err(Box::new(RepresentationError::IllegalStatementForUpdate { source_span: relation.span }));
+            }
+        }
+        for constraint in &thing_statement.constraints {
+            match constraint {
+                Constraint::Has(has_constraint) => match &has_constraint.value {
+                    HasValue::Variable(variable) => {
+                        verify_variable_available!(context, variable => UpdateVariableUnavailable)?;
+                    }
+                    HasValue::Expression(expression) => {
+                        validate_write_stage_expression_variables_availability(context, expression)?
+                    }
+                    HasValue::Comparison(comparison) => {
+                        validate_write_stage_expression_variables_availability(context, &comparison.rhs)?
+                    }
+                },
+                Constraint::Links(links_constraint) => {
+                    for rp in &links_constraint.relation.role_players {
+                        let (RolePlayer::Typed(_, player) | RolePlayer::Untyped(player)) = rp;
+                        verify_variable_available!(context, player => UpdateVariableUnavailable)?;
+                    }
+                }
+                Constraint::Isa(isa) => {
+                    return Err(Box::new(RepresentationError::IllegalStatementForUpdate { source_span: isa.span }));
+                }
+                Constraint::Iid(iid) => {
+                    return Err(Box::new(RepresentationError::IllegalStatementForUpdate { source_span: iid.span }));
+                }
+            }
+        }
+    } else {
+        return Err(Box::new(RepresentationError::IllegalStatementForUpdate { source_span: statement.span() }));
+    }
+    Ok(())
+}
+
+fn validate_write_stage_expression_variables_availability(
+    context: &PipelineTranslationContext,
+    expression: &Expression,
+) -> Result<(), Box<RepresentationError>> {
+    match expression {
+        Expression::Variable(variable) => {
+            verify_variable_available!(context, variable => DeleteVariableUnavailable)?;
+            Ok(())
+        }
+        Expression::ListIndex(list_index) => {
+            verify_variable_available!(context, list_index.variable => DeleteVariableUnavailable)?;
+            validate_write_stage_expression_variables_availability(context, &list_index.index)
+        }
+        Expression::Value(value) => Ok(()),
+        Expression::Function(function_call) => {
+            // TODO: We may want to verify user-defined function names here as well.
+            // They are generally not supported in the execution, so we skip it now.
+            function_call
+                .args
+                .iter()
+                .try_fold((), |_, arg| validate_write_stage_expression_variables_availability(context, arg))
+        }
+        Expression::Operation(operation) => {
+            validate_write_stage_expression_variables_availability(context, &operation.left)?;
+            validate_write_stage_expression_variables_availability(context, &operation.right)
+        }
+        Expression::Paren(paren) => validate_write_stage_expression_variables_availability(context, &paren.inner),
+        Expression::List(list) => list
+            .items
+            .iter()
+            .try_fold((), |_, item| validate_write_stage_expression_variables_availability(context, item)),
+        Expression::ListIndexRange(list_index_range) => {
+            verify_variable_available!(context, list_index_range.var => DeleteVariableUnavailable)?;
+            validate_write_stage_expression_variables_availability(context, &list_index_range.from)?;
+            validate_write_stage_expression_variables_availability(context, &list_index_range.to)
+        }
+        Expression::ScopedLabel(_) => Ok(()),
+        Expression::Label(_) => Ok(()),
+    }
+}
+
+fn validate_deleted_variables_availability(
+    context: &mut PipelineTranslationContext,
+    delete: &typeql::query::stage::Delete,
+) -> Result<(), Box<RepresentationError>> {
+    for deletable in &delete.deletables {
+        validate_deleted_variable_availability_deletable(context, deletable)?;
+    }
+    Ok(())
+}
+
+fn validate_deleted_variable_availability_deletable(
+    context: &mut PipelineTranslationContext,
+    deletable: &Deletable,
+) -> Result<(), Box<RepresentationError>> {
+    match &deletable.kind {
+        DeletableKind::Has { owner, attribute } => {
+            verify_variable_available!(context, owner => DeleteVariableUnavailable)?;
+            verify_variable_available!(context, attribute => DeleteVariableUnavailable)?;
+        }
+        DeletableKind::Links { relation, players } => {
+            verify_variable_available!(context, relation => DeleteVariableUnavailable)?;
+            players.role_players.iter().try_for_each(|rp| match rp {
+                RolePlayer::Typed(_, player) | RolePlayer::Untyped(player) => {
+                    verify_variable_available!(context, player => DeleteVariableUnavailable).map(|_| ())
+                }
+            })?;
+        }
+        DeletableKind::Concept { variable } => {
+            let translated = verify_variable_available!(context, variable => DeleteVariableUnavailable)?;
+            context.variable_registry.set_deleted_variable_category(translated)?;
+        }
+        DeletableKind::Optional { deletables } => {
+            for deletable in deletables {
+                debug_assert!(!matches!(deletable.kind, DeletableKind::Optional { .. } | DeletableKind::If { .. }));
+                validate_deleted_variable_availability_deletable(context, deletable)?;
+            }
+        }
+        DeletableKind::If { conditions, deletables } => {
+            for condition in conditions {
+                validate_write_condition_variable_availability(context, condition)?;
+            }
+            for deletable in deletables {
+                debug_assert!(!matches!(deletable.kind, DeletableKind::Optional { .. }));
+                validate_deleted_variable_availability_deletable(context, deletable)?;
+            }
+        }
+    };
+    Ok(())
+}
+
+fn validate_write_condition_variable_availability(
+    context: &mut PipelineTranslationContext,
+    condition: &WriteCondition,
+) -> Result<(), Box<RepresentationError>> {
+    match condition {
+        WriteCondition::IsSet(isset) => {
+            for variable in &isset.variables {
+                verify_variable_available!(context, variable => DeleteVariableUnavailable)?;
+            }
+        }
+        WriteCondition::Comparison(_) => (), // expressions are validated at translation time
+        WriteCondition::Isa { variable, .. } => {
+            verify_variable_available!(context, variable => DeleteVariableUnavailable)?;
+        }
+    }
+    Ok(())
+}

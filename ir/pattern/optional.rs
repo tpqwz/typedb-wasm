@@ -1,0 +1,106 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+use std::{collections::HashMap, fmt};
+
+use answer::variable::Variable;
+use structural_equality::StructuralEquality;
+use typeql::common::Span;
+
+use crate::pattern::{
+    BindingMode, BranchID, Pattern, PatternVariableModes, Scope, ScopeId,
+    conjunction::{Conjunction, ConjunctionBuilder},
+    impl_pattern_from_pattern_variables,
+    nested_pattern::NestedPattern,
+};
+
+#[derive(Debug, Clone)]
+pub struct Optional {
+    conjunction: Conjunction,
+    branch_id: BranchID,
+    pattern_variables: PatternVariableModes,
+    source_span: Option<Span>,
+}
+
+impl Optional {
+    pub fn conjunction(&self) -> &Conjunction {
+        &self.conjunction
+    }
+
+    pub fn branch_id(&self) -> BranchID {
+        self.branch_id
+    }
+
+    pub fn conjunction_mut(&mut self) -> &mut Conjunction {
+        &mut self.conjunction
+    }
+
+    pub(crate) fn source_span(&self) -> Option<Span> {
+        self.source_span
+    }
+}
+
+impl_pattern_from_pattern_variables!(Optional);
+
+impl Scope for Optional {
+    fn scope_id(&self) -> ScopeId {
+        self.conjunction.scope_id()
+    }
+}
+
+impl StructuralEquality for Optional {
+    fn hash(&self) -> u64 {
+        self.conjunction.hash()
+    }
+
+    fn equals(&self, other: &Self) -> bool {
+        self.conjunction.equals(&other.conjunction)
+    }
+}
+
+impl fmt::Display for Optional {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        error::todo_display_for_error!(f, self)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct OptionalBuilder {
+    conjunction: ConjunctionBuilder,
+    branch_id: BranchID,
+    source_span: Option<Span>,
+}
+
+impl OptionalBuilder {
+    pub(crate) fn new(scope_id: ScopeId, branch_id: BranchID, source_span: Option<Span>) -> Self {
+        let conjunction = ConjunctionBuilder::new(scope_id);
+        Self { conjunction, branch_id, source_span }
+    }
+
+    pub(crate) fn finish(self, parent_modes: &PatternVariableModes) -> NestedPattern {
+        let source_span = self.source_span;
+        let pattern_variables = PatternVariableModes::build(self.variable_binding_modes(), parent_modes, []);
+        let branch_id = self.branch_id;
+        let conjunction = self.conjunction.finish(&pattern_variables);
+        NestedPattern::Optional(Optional { branch_id, conjunction, pattern_variables, source_span })
+    }
+
+    pub(crate) fn conjunction(&self) -> &ConjunctionBuilder {
+        &self.conjunction
+    }
+
+    pub fn conjunction_mut(&mut self) -> &mut ConjunctionBuilder {
+        &mut self.conjunction
+    }
+
+    pub(crate) fn variable_binding_modes(&self) -> HashMap<Variable, BindingMode> {
+        self.conjunction
+            .variable_binding_modes()
+            .into_iter()
+            .map(|(v, mode)| if mode.is_always_binding() { (v, BindingMode::BoundInTry) } else { (v, mode) })
+            .collect()
+    }
+}

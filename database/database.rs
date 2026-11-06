@@ -1,0 +1,1003 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+use std::{
+    collections::{BTreeMap, VecDeque},
+    ffi::OsString,
+    fmt, fs, io, mem,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex, MutexGuard, RwLock, TryLockError,
+        mpsc::{Receiver, SyncSender, sync_channel},
+    },
+    time::{Duration, Instant},
+};
+
+use concept::{
+    thing::{
+        cleanup::{CleanupIntervals, CleanupRecord},
+        statistics::{Statistics, StatisticsError, deltas::CommitDeltas},
+    },
+    type_::type_manager::{
+        TypeManager,
+        type_cache::{TypeCache, TypeCacheCreateError},
+    },
+};
+use concurrency::IntervalRunner;
+use diagnostics::{
+    diagnostics_manager::DiagnosticsManager,
+    metrics::{DataLoadMetrics, DatabaseMetricsSnapshot, FsyncMetrics, SchemaLoadMetrics},
+};
+use durability::{
+    DurabilitySequenceNumber, DurabilityServiceError,
+    vfs,
+    wal::{WAL, WALError},
+};
+use encoding::{
+    EncodingKeyspace,
+    error::EncodingError,
+    graph::{
+        definition::definition_key_generator::DefinitionKeyGenerator, thing::vertex_generator::ThingVertexGenerator,
+        type_::vertex_generator::TypeVertexGenerator,
+    },
+};
+use error::typedb_error;
+use fail_point::{UNFINISHED_CHECKPOINT, fail_point};
+use function::{FunctionError, function_cache::FunctionCache};
+use itertools::Itertools;
+use options::MvccCleanupStrategy;
+use query::query_cache::QueryCache;
+use resource::constants::database::{CHECKPOINT_INTERVAL, CLEANUP_WAKEUP_INTERVAL, STATISTICS_UPDATE_INTERVAL};
+use storage::{
+    MVCCStorage, StorageDeleteError, StorageOpenError, StorageResetError,
+    durability_client::{DurabilityClient, DurabilityClientError, WALClient},
+    keyspace::rocks_resources::RocksResources,
+    recovery::checkpoint::{CheckpointCreateError, CheckpointLoadError, CheckpointReader, CheckpointWriter},
+    sequence_number::SequenceNumber,
+    snapshot::snapshot_id::SnapshotId,
+};
+use tracing::{Level, debug, error, event, info, trace};
+
+use crate::{
+    DatabaseOpenError::FunctionCacheInitialise,
+    DatabaseResetError::{
+        CorruptionPartialResetKeyGeneratorInUse, CorruptionPartialResetThingVertexGeneratorInUse,
+        CorruptionPartialResetTypeVertexGeneratorInUse,
+    },
+    database_manager::DatabaseManager,
+    transaction::TransactionError,
+};
+
+#[derive(Debug, Clone)]
+pub(super) struct Schema {
+    pub(super) thing_statistics: Arc<Statistics>,
+    pub(super) type_cache: Arc<TypeCache>,
+    pub(super) function_cache: Arc<FunctionCache>,
+}
+
+type ReservationRequestId = u64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransactionReservationKind {
+    Write,
+    Schema,
+}
+
+struct TransactionReservationRequest {
+    id: ReservationRequestId,
+    kind: TransactionReservationKind,
+    notifier: SyncSender<()>,
+}
+
+struct SchemaWriteTransactionState {
+    has_schema_transaction: bool,
+    running_write_transactions: usize,
+    queue: VecDeque<TransactionReservationRequest>,
+    next_request_id: ReservationRequestId,
+}
+
+impl SchemaWriteTransactionState {
+    fn new() -> Self {
+        Self {
+            has_schema_transaction: false,
+            running_write_transactions: 0,
+            queue: VecDeque::with_capacity(100),
+            next_request_id: 0,
+        }
+    }
+
+    fn enqueue(&mut self, kind: TransactionReservationKind) -> (Receiver<()>, ReservationRequestId) {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        let (notifier, receiver) = sync_channel::<()>(0);
+        self.queue.push_back(TransactionReservationRequest { id, kind, notifier });
+        (receiver, id)
+    }
+
+    fn is_blocked(&self, kind: TransactionReservationKind) -> bool {
+        self.has_schema_transaction
+            || (kind == TransactionReservationKind::Schema && self.running_write_transactions > 0)
+    }
+
+    fn admit(&mut self, kind: TransactionReservationKind) {
+        match kind {
+            TransactionReservationKind::Schema => self.has_schema_transaction = true,
+            TransactionReservationKind::Write => self.running_write_transactions += 1,
+        }
+        trace!(
+            "Admitted {:?} transaction. State of reservation: has_schema_transaction = {}, running_write_transactions = {}.",
+            kind, self.has_schema_transaction, self.running_write_transactions,
+        );
+    }
+
+    fn release(&mut self, kind: TransactionReservationKind) {
+        match kind {
+            TransactionReservationKind::Schema => self.has_schema_transaction = false,
+            TransactionReservationKind::Write => self.running_write_transactions -= 1,
+        }
+        trace!(
+            "Released {:?} transaction. State of reservation: has_schema_transaction = {}, running_write_transactions = {}.",
+            kind, self.has_schema_transaction, self.running_write_transactions,
+        );
+        self.fulfill_requests_until_blocked();
+    }
+
+    fn fulfill_requests_until_blocked(&mut self) {
+        while let Some(kind) = self.queue.front().map(|request| request.kind) {
+            if self.is_blocked(kind) {
+                break;
+            }
+            let request = self.queue.pop_front().expect("Expected the peeked request");
+            if request.notifier.send(()).is_ok() {
+                self.admit(kind);
+            }
+        }
+    }
+}
+
+pub struct Database<D> {
+    name: Arc<str>,
+    pub(super) path: PathBuf,
+    pub(super) storage: Arc<MVCCStorage<D>>,
+    pub(super) definition_key_generator: Arc<DefinitionKeyGenerator>,
+    pub(super) type_vertex_generator: Arc<TypeVertexGenerator>,
+    pub(super) thing_vertex_generator: Arc<ThingVertexGenerator>,
+
+    pub(super) schema: Arc<RwLock<Schema>>,
+    pub(super) query_cache: Arc<QueryCache>,
+    pub(super) _cleanup_queue: Arc<RwLock<BTreeMap<SequenceNumber, CleanupIntervals>>>,
+    pub(super) commit_deltas_queue: Arc<RwLock<BTreeMap<SequenceNumber, CommitDeltas>>>,
+
+    schema_write_transaction_exclusivity: Arc<Mutex<SchemaWriteTransactionState>>,
+    background_workers: BackgroundWorkers,
+}
+
+struct BackgroundWorkers {
+    _statistics_updater: IntervalRunner,
+    _checkpointer: IntervalRunner,
+    _cleanup_worker: IntervalRunner,
+}
+
+impl<D> fmt::Debug for Database<D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Database").field("name", &self.name).field("path", &self.path).finish_non_exhaustive()
+    }
+}
+
+impl<D> Database<D> {
+    const TRY_LOCK_SLEEP_INTERVAL: Duration = Duration::from_millis(10);
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn name_arc(&self) -> Arc<str> {
+        self.name.clone()
+    }
+
+    // Must be called before serving write transactions in case the storage was modified with
+    // instances that WERE NOT generated by this server (manual storage modification / replication).
+    pub fn prepare_for_writes(&self) -> Result<(), EncodingError> {
+        self.thing_vertex_generator.sync_from_storage(self.storage.clone())
+    }
+
+    pub(super) fn reserve_write_transaction(&self, timeout: Duration) -> Result<(), TransactionError> {
+        self.reserve_transaction(TransactionReservationKind::Write, timeout)
+    }
+
+    pub(super) fn reserve_schema_transaction(&self, timeout: Duration) -> Result<(), TransactionError> {
+        self.reserve_transaction(TransactionReservationKind::Schema, timeout)
+    }
+
+    fn reserve_transaction(&self, kind: TransactionReservationKind, timeout: Duration) -> Result<(), TransactionError> {
+        let (mut guard, timeout_left) = self.try_acquire_schema_write_transaction_lock(timeout)?;
+        if guard.queue.is_empty() && !guard.is_blocked(kind) {
+            guard.admit(kind);
+            return Ok(());
+        }
+        let (receiver, id) = guard.enqueue(kind);
+        drop(guard);
+        trace!("Could not admit {kind:?} transaction immediately; waiting...");
+        self.await_reservation(receiver, id, timeout_left)
+    }
+
+    fn await_reservation(
+        &self,
+        receiver: Receiver<()>,
+        id: ReservationRequestId,
+        timeout: Duration,
+    ) -> Result<(), TransactionError> {
+        let source = match receiver.recv_timeout(timeout) {
+            Ok(()) => return Ok(()),
+            Err(source) => source,
+        };
+        // Dropped before locking: a concurrent fulfillment would otherwise block in `send` while
+        // holding the lock this thread is about to wait for.
+        drop(receiver);
+
+        let mut guard = self
+            .schema_write_transaction_exclusivity
+            .lock()
+            .expect("Expected exclusive access to withdraw a reservation request");
+        guard.queue.retain(|request| request.id != id);
+        guard.fulfill_requests_until_blocked();
+        trace!("Reservation timed out (timeout = {timeout:?}).");
+        Err(TransactionError::Timeout { source })
+    }
+
+    pub(super) fn release_write_transaction(&self) {
+        self.release_transaction(TransactionReservationKind::Write)
+    }
+
+    pub(super) fn release_schema_transaction(&self) {
+        self.release_transaction(TransactionReservationKind::Schema)
+    }
+
+    fn release_transaction(&self, kind: TransactionReservationKind) {
+        let mut guard = self
+            .schema_write_transaction_exclusivity
+            .lock()
+            .expect("The exclusive access should already be acquired in `reserve`");
+        guard.release(kind);
+    }
+
+    fn try_acquire_schema_write_transaction_lock(
+        &self,
+        timeout: Duration,
+    ) -> Result<(MutexGuard<'_, SchemaWriteTransactionState>, Duration), TransactionError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let guard = self
+                .schema_write_transaction_exclusivity
+                .lock()
+                .expect("schema write lock");
+            return Ok((guard, timeout));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+        let start_time = Instant::now();
+        let guard = loop {
+            match self.schema_write_transaction_exclusivity.try_lock() {
+                Ok(guard) => break guard,
+                Err(TryLockError::WouldBlock) => {
+                    if start_time.elapsed() >= timeout {
+                        return Err(TransactionError::WriteExclusivityTimeout {});
+                    }
+                    std::thread::sleep(Self::TRY_LOCK_SLEEP_INTERVAL);
+                }
+                Err(TryLockError::Poisoned(err)) => panic!(
+                    "Encountered a poisoned lock while trying to acquire exclusive schema write transaction access: {}",
+                    err
+                ),
+            }
+        };
+
+        let elapsed = start_time.elapsed();
+        let remaining_timeout = if timeout < elapsed { Duration::from_millis(0) } else { timeout - elapsed };
+
+        Ok((guard, remaining_timeout))
+        }
+    }
+}
+
+impl<D: DurabilityClient> Database<D> {
+    pub fn commit_record_exists(
+        &self,
+        open_sequence_number: DurabilitySequenceNumber,
+        snapshot_id: SnapshotId,
+    ) -> Result<bool, Box<DatabaseOpenError>> {
+        self.storage
+            .commit_record_exists(open_sequence_number, snapshot_id)
+            .map_err(|typedb_source| Box::new(DatabaseOpenError::DurabilityClientRead { typedb_source }))
+    }
+}
+
+impl Database<WALClient> {
+    const RESET_EXCLUSIVITY_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
+
+    pub fn open(
+        path: &Path,
+        diagnostics_manager: &DiagnosticsManager,
+        rocks_resources: &RocksResources,
+        cleanup_strategy: MvccCleanupStrategy,
+    ) -> Result<Database<WALClient>, Box<DatabaseOpenError>> {
+        use DatabaseOpenError::InvalidUnicodeName;
+
+        let file_name = path.file_name().unwrap();
+        let name = file_name.to_str().ok_or_else(|| InvalidUnicodeName { name: file_name.to_owned() })?;
+        let wal_metrics = diagnostics_manager.wal_metrics(name, DatabaseManager::is_internal_database(name));
+
+        if vfs::exists(path) {
+            Self::load(path, name, wal_metrics, rocks_resources, cleanup_strategy)
+        } else {
+            Self::create(path, name, wal_metrics, rocks_resources, cleanup_strategy)
+        }
+    }
+
+    fn create(
+        path: &Path,
+        name: impl AsRef<str>,
+        wal_metrics: FsyncMetrics,
+        rocks_resources: &RocksResources,
+        cleanup_strategy: MvccCleanupStrategy,
+    ) -> Result<Database<WALClient>, Box<DatabaseOpenError>> {
+        use DatabaseOpenError::{
+            DirectoryCreate, Encoding, FunctionCacheInitialise, StorageOpen, TypeCacheInitialise, WALOpen,
+        };
+
+        let name = name.as_ref();
+
+        vfs::create_dir(path).map_err(|source| DirectoryCreate { name: name.to_string(), source: Arc::new(source) })?;
+
+        let wal = WAL::create(path, wal_metrics).map_err(|source| WALOpen { source })?;
+        let mut wal_client = WALClient::new(wal);
+        wal_client.register_record_type::<Statistics>();
+        wal_client.register_record_type::<CleanupRecord>();
+        wal_client.register_record_type::<CommitDeltas>();
+
+        let storage = Arc::new(
+            MVCCStorage::create::<EncodingKeyspace>(name, path, wal_client, rocks_resources)
+                .map_err(|error| StorageOpen { typedb_source: error })?,
+        );
+        let definition_key_generator = Arc::new(DefinitionKeyGenerator::new());
+        let type_vertex_generator = Arc::new(TypeVertexGenerator::new());
+        let thing_vertex_generator =
+            Arc::new(ThingVertexGenerator::load(storage.clone()).map_err(|err| Encoding { source: err })?);
+        let thing_statistics = Arc::new(Statistics::new(storage.snapshot_watermark()));
+        let type_cache = Arc::new(
+            TypeCache::new(storage.clone(), SequenceNumber::MIN)
+                .map_err(|error| TypeCacheInitialise { typedb_source: error })?,
+        );
+
+        let function_cache = Arc::new(
+            FunctionCache::new(
+                storage.clone(),
+                &TypeManager::new(definition_key_generator.clone(), type_vertex_generator.clone(), None),
+                SequenceNumber::MIN,
+            )
+            .map_err(|error| FunctionCacheInitialise { typedb_source: *error })?,
+        );
+
+        let schema = Arc::new(RwLock::new(Schema { thing_statistics, type_cache, function_cache }));
+        let schema_write_transaction_exclusivity = Arc::new(Mutex::new(SchemaWriteTransactionState::new()));
+
+        let query_cache = Arc::new(QueryCache::new());
+        let commit_deltas_queue = Arc::<RwLock<BTreeMap<SequenceNumber, CommitDeltas>>>::default();
+        let update_statistics_fn = make_update_statistics_fn(
+            name.to_owned(),
+            storage.clone(),
+            schema.clone(),
+            schema_write_transaction_exclusivity.clone(),
+            query_cache.clone(),
+            commit_deltas_queue.clone(),
+        );
+
+        let checkpoint_fn = make_checkpoint_fn(name.to_owned(), path.to_owned(), SequenceNumber::MIN, storage.clone());
+
+        let cleanup_queue = Arc::<RwLock<BTreeMap<SequenceNumber, CleanupIntervals>>>::default();
+        let cleanup_fn =
+            make_cleanup_fn(name.to_owned(), storage.clone(), schema.clone(), cleanup_queue.clone(), cleanup_strategy);
+
+        Ok(Database::<WALClient> {
+            name: Arc::<str>::from(name),
+            path: path.to_owned(),
+            storage,
+            definition_key_generator,
+            type_vertex_generator,
+            thing_vertex_generator,
+            schema,
+            query_cache,
+            _cleanup_queue: cleanup_queue,
+            commit_deltas_queue,
+            schema_write_transaction_exclusivity,
+            background_workers: BackgroundWorkers {
+                _statistics_updater: IntervalRunner::new(update_statistics_fn, STATISTICS_UPDATE_INTERVAL),
+                _checkpointer: IntervalRunner::new(checkpoint_fn, CHECKPOINT_INTERVAL),
+                _cleanup_worker: IntervalRunner::new(cleanup_fn, CLEANUP_WAKEUP_INTERVAL),
+            },
+        })
+    }
+
+    fn load(
+        path: &Path,
+        name: impl AsRef<str>,
+        wal_metrics: FsyncMetrics,
+        rocks_resources: &RocksResources,
+        cleanup_strategy: MvccCleanupStrategy,
+    ) -> Result<Database<WALClient>, Box<DatabaseOpenError>> {
+        use DatabaseOpenError::{
+            CheckpointLoad, DurabilityClientRead, Encoding, NotADatabase, StatisticsInitialise, StorageOpen,
+            TypeCacheInitialise, WALOpen,
+        };
+        let name = name.as_ref();
+        event!(
+            Level::TRACE,
+            "Loading database '{}', at path '{:?}' (absolute path: '{:?}').",
+            &name,
+            path,
+            std::path::absolute(path)
+        );
+
+        event!(Level::TRACE, "Loading database '{}' WAL.", &name);
+        let wal = match WAL::load(path, wal_metrics) {
+            Ok(wal) => wal,
+            Err(DurabilityServiceError::WAL { source: WALError::LoadDirectoryMissing { .. } }) => {
+                return Err(Box::new(NotADatabase { name: name.to_owned() }));
+            }
+            Err(source) => return Err(Box::new(WALOpen { source })),
+        };
+
+        let wal_last_sequence_number = wal.previous();
+
+        let mut wal_client = WALClient::new(wal);
+        wal_client.register_record_type::<Statistics>();
+        wal_client.register_record_type::<CleanupRecord>();
+        wal_client.register_record_type::<CommitDeltas>();
+
+        event!(Level::TRACE, "Loading last database '{}' checkpoint", &name);
+        let checkpoint = CheckpointReader::open_latest::<EncodingKeyspace>(path)
+            .map_err(|err| CheckpointLoad { name: name.to_string(), typedb_source: err })?;
+        let storage = Arc::new(
+            MVCCStorage::load::<EncodingKeyspace>(&name, path, wal_client, &checkpoint, rocks_resources)
+                .map_err(|error| StorageOpen { typedb_source: error })?,
+        );
+        let definition_key_generator = Arc::new(DefinitionKeyGenerator::new());
+        let type_vertex_generator = Arc::new(TypeVertexGenerator::new());
+        let thing_vertex_generator =
+            Arc::new(ThingVertexGenerator::load(storage.clone()).map_err(|err| Encoding { source: err })?);
+
+        event!(Level::TRACE, "Finding last database '{}' statistics WAL entry", &name);
+        let mut thing_statistics = storage
+            .durability()
+            .find_last_unsequenced_type::<Statistics>()
+            .map_err(|typedb_source| DurabilityClientRead { typedb_source })?
+            .unwrap_or_else(|| Statistics::new(SequenceNumber::MIN));
+        event!(
+            Level::TRACE,
+            "Synchronising database '{}' statistics from seq nr '{}'",
+            &name,
+            thing_statistics.sequence_number
+        );
+        thing_statistics
+            .synchronise_from_wal_and_persist(&storage)
+            .map_err(|err| StatisticsInitialise { typedb_source: err })?;
+        event!(Level::TRACE, "Thing statistics: {:?}", thing_statistics);
+        let thing_statistics = Arc::new(thing_statistics);
+
+        let type_cache = Arc::new(
+            TypeCache::new(storage.clone(), wal_last_sequence_number)
+                .map_err(|error| TypeCacheInitialise { typedb_source: error })?,
+        );
+
+        let function_cache = Arc::new(
+            FunctionCache::new(
+                storage.clone(),
+                &TypeManager::new(definition_key_generator.clone(), type_vertex_generator.clone(), None),
+                wal_last_sequence_number,
+            )
+            .map_err(|error| FunctionCacheInitialise { typedb_source: *error })?,
+        );
+
+        let checkpoint_sequence_number = match checkpoint {
+            None => SequenceNumber::MIN,
+            Some(checkpoint) => {
+                checkpoint
+                    .read_metadata()
+                    .map_err(|err| CheckpointLoad { name: name.to_string(), typedb_source: err })?
+                    .watermark
+            }
+        };
+
+        let schema = Arc::new(RwLock::new(Schema { thing_statistics, type_cache, function_cache }));
+        let schema_write_transaction_exclusivity = Arc::new(Mutex::new(SchemaWriteTransactionState::new()));
+
+        let query_cache = Arc::new(QueryCache::new());
+        let commit_deltas_queue = Arc::<RwLock<BTreeMap<SequenceNumber, CommitDeltas>>>::default();
+        let update_statistics_fn = make_update_statistics_fn(
+            name.to_owned(),
+            storage.clone(),
+            schema.clone(),
+            schema_write_transaction_exclusivity.clone(),
+            query_cache.clone(),
+            commit_deltas_queue.clone(),
+        );
+        let checkpoint_fn =
+            make_checkpoint_fn(name.to_owned(), path.to_owned(), checkpoint_sequence_number, storage.clone());
+
+        let earliest_uncleaned = storage.earliest_uncleaned();
+        let cleanup_queue = if let MvccCleanupStrategy::Disabled = cleanup_strategy {
+            Default::default()
+        } else {
+            Arc::new(RwLock::new(
+                storage
+                    .durability()
+                    .iter_type_from::<CleanupRecord>(earliest_uncleaned)
+                    .and_then(|iter| {
+                        iter.map_ok(|(_, record)| (record.sequence_number, record.cleanup_intervals)).try_collect()
+                    })
+                    .map_err(|typedb_source| DatabaseOpenError::DurabilityClientRead { typedb_source })?,
+            ))
+        };
+        let cleanup_fn =
+            make_cleanup_fn(name.to_owned(), storage.clone(), schema.clone(), cleanup_queue.clone(), cleanup_strategy);
+
+        let database = Database::<WALClient> {
+            name: Arc::<str>::from(name),
+            path: path.to_owned(),
+            storage,
+            definition_key_generator,
+            type_vertex_generator,
+            thing_vertex_generator,
+            schema,
+            query_cache,
+            _cleanup_queue: cleanup_queue,
+            commit_deltas_queue,
+            schema_write_transaction_exclusivity,
+            background_workers: BackgroundWorkers {
+                _statistics_updater: IntervalRunner::new(update_statistics_fn, STATISTICS_UPDATE_INTERVAL),
+                _checkpointer: IntervalRunner::new_with_initial_delay(
+                    checkpoint_fn,
+                    CHECKPOINT_INTERVAL,
+                    CHECKPOINT_INTERVAL,
+                ),
+                _cleanup_worker: IntervalRunner::new(cleanup_fn, CLEANUP_WAKEUP_INTERVAL),
+            },
+        };
+
+        if checkpoint_sequence_number < wal_last_sequence_number {
+            database.checkpoint().map_err(|err| DatabaseOpenError::CheckpointCreate {
+                name: name.to_string(),
+                source: err,
+            })?;
+        }
+
+        database.prepare_for_writes().map_err(|typedb_source| DatabaseOpenError::Encoding { source: typedb_source })?;
+        event!(Level::TRACE, "Finished loading database '{}'", &name);
+        Ok(database)
+    }
+
+    fn checkpoint(&self) -> Result<(), CheckpointCreateError> {
+        checkpoint_storage(&self.name, &self.path, &self.storage)
+    }
+
+    pub(crate) fn checkpoint_and_close(self) -> Result<(), DatabaseCloseError> {
+        use DatabaseCloseError::{CheckpointCreate, StatisticsPersist};
+
+        let Self { name, path, storage, schema, background_workers, .. } = self;
+        drop(background_workers);
+
+        let mut statistics = (*schema.read().unwrap().thing_statistics).clone();
+        statistics
+            .synchronise_from_wal_and_persist(&storage)
+            .map_err(|typedb_source| StatisticsPersist { name: name.to_string(), typedb_source })?;
+
+        checkpoint_storage(&name, &path, &storage).map_err(|source| CheckpointCreate { name: name.to_string(), source })
+    }
+
+    #[allow(clippy::drop_non_drop)]
+    pub fn delete(self) -> Result<(), DatabaseDeleteError> {
+        trace!("Deleting database '{}'.", &self.name);
+        drop(self.background_workers);
+        drop(Arc::into_inner(self.schema).expect("Cannot get exclusive ownership of inner of Arc<Schema>."));
+        drop(Arc::into_inner(self.query_cache).expect("Cannot get exclusive ownership of inner of Arc<QueryCache>."));
+        drop(
+            Arc::into_inner(self.type_vertex_generator)
+                .expect("Cannot get exclusive ownership of inner of Arc<TypeVertexGenerator>"),
+        );
+        drop(
+            Arc::into_inner(self.thing_vertex_generator)
+                .expect("Cannot get exclusive ownership of inner of Arc<ThingVertexGenerator>"),
+        );
+        drop(
+            Arc::into_inner(self.definition_key_generator)
+                .expect("Cannot get exclusive ownership of inner of Arc<DefinitionKeyGenerator>"),
+        );
+        Arc::into_inner(self.storage)
+            .expect("Cannot get exclusive ownership of inner of Arc<MVCCStorage>.")
+            .delete_storage()
+            .map_err(|err| DatabaseDeleteError::StorageDelete { typedb_source: err })?;
+        let path = self.path;
+        fs::remove_dir_all(path).map_err(|err| DatabaseDeleteError::DirectoryDelete { source: Arc::new(err) })?;
+        Ok(())
+    }
+
+    pub fn reset(&mut self) -> Result<(), Box<DatabaseResetError>> {
+        self.reserve_schema_transaction(Self::RESET_EXCLUSIVITY_ACQUIRE_TIMEOUT)
+            .map_err(|typedb_source| DatabaseResetError::Transaction { typedb_source })?;
+        let result = self.reset_with_schema_exclusivity();
+        self.release_schema_transaction();
+        result
+    }
+
+    fn reset_with_schema_exclusivity(&mut self) -> Result<(), Box<DatabaseResetError>> {
+        use DatabaseResetError::CorruptionPartialResetStorageInUse;
+
+        let mut locked_schema = self.schema.write().unwrap();
+
+        match Arc::get_mut(&mut self.storage) {
+            None => return Err(Box::new(DatabaseResetError::StorageInUse {})),
+            Some(storage) => {
+                storage.reset().map_err(|err| CorruptionPartialResetStorageInUse { typedb_source: err })?
+            }
+        }
+        match Arc::get_mut(&mut self.definition_key_generator) {
+            None => return Err(Box::new(CorruptionPartialResetKeyGeneratorInUse {})),
+            Some(definition_key_generator) => definition_key_generator.reset(),
+        }
+        match Arc::get_mut(&mut self.type_vertex_generator) {
+            None => return Err(Box::new(CorruptionPartialResetTypeVertexGeneratorInUse {})),
+            Some(type_vertex_generator) => type_vertex_generator.reset(),
+        }
+        match Arc::get_mut(&mut self.thing_vertex_generator) {
+            None => return Err(Box::new(CorruptionPartialResetThingVertexGeneratorInUse {})),
+            Some(thing_vertex_generator) => thing_vertex_generator.reset(),
+        }
+
+        let thing_statistics = Arc::get_mut(&mut locked_schema.thing_statistics).unwrap();
+        thing_statistics.reset(self.storage.snapshot_watermark());
+
+        self.query_cache.force_reset(&Statistics::new(SequenceNumber::MIN));
+
+        Ok(())
+    }
+
+    pub fn get_metrics(&self) -> DatabaseMetricsSnapshot {
+        let schema = self.schema.read().expect("Expected database schema lock acquisition");
+        DatabaseMetricsSnapshot {
+            schema: SchemaLoadMetrics { type_count: schema.type_cache.get_types_count() },
+            data: DataLoadMetrics {
+                entity_count: schema.thing_statistics.total_entity_count,
+                relation_count: schema.thing_statistics.total_relation_count,
+                attribute_count: schema.thing_statistics.total_attribute_count,
+                has_count: schema.thing_statistics.total_has_count,
+                role_count: schema.thing_statistics.total_role_count,
+                storage_in_bytes: self.storage.estimate_size_in_bytes().expect("Expected storage size in bytes"),
+                storage_key_count: self.storage.estimate_key_count().expect("Expected storage key count"),
+            },
+        }
+    }
+}
+
+fn make_checkpoint_fn(
+    database_name: String,
+    path: PathBuf,
+    mut prev_checkpoint: SequenceNumber,
+    storage: Arc<MVCCStorage<WALClient>>,
+) -> impl FnMut() {
+    move || {
+        let watermark = storage.snapshot_watermark();
+        if prev_checkpoint < watermark {
+            checkpoint_storage(&database_name, &path, &storage).unwrap();
+            prev_checkpoint = watermark;
+        }
+    }
+}
+
+fn checkpoint_storage(
+    database_name: &str,
+    path: &Path,
+    storage: &MVCCStorage<WALClient>,
+) -> Result<(), CheckpointCreateError> {
+    debug!("Starting checkpoint for database {database_name}");
+    let checkpoint = CheckpointWriter::new(path)?;
+    storage.checkpoint(&checkpoint)?;
+    fail_point!(UNFINISHED_CHECKPOINT);
+    checkpoint.finish()?;
+    debug!("Finished checkpoint for database {database_name}");
+    Ok(())
+}
+
+fn make_update_statistics_fn(
+    database_name: String,
+    storage: Arc<MVCCStorage<WALClient>>,
+    schema: Arc<RwLock<Schema>>,
+    schema_write_transaction_exclusivity: Arc<Mutex<SchemaWriteTransactionState>>,
+    query_cache: Arc<QueryCache>,
+    commit_deltas_queue: Arc<RwLock<BTreeMap<SequenceNumber, CommitDeltas>>>,
+) -> impl Fn() {
+    struct ScopeGuard<F: FnOnce()>(Option<F>);
+    impl<F: FnOnce()> Drop for ScopeGuard<F> {
+        fn drop(&mut self) {
+            (self.0.take().unwrap())()
+        }
+    }
+
+    move || {
+        let watermark = storage.snapshot_watermark();
+        if watermark > schema.read().unwrap().thing_statistics.sequence_number {
+            let mut schema_txn_guard = schema_write_transaction_exclusivity.lock().unwrap(); // prevent Schema txns from opening during statistics update
+            if schema_txn_guard.is_blocked(TransactionReservationKind::Write) {
+                // better luck next time
+                return;
+            }
+            schema_txn_guard.admit(TransactionReservationKind::Write);
+            drop(schema_txn_guard);
+
+            let mut new_statistics = (*schema.read().unwrap().thing_statistics).clone();
+            debug!("Starting updating statistics for database {database_name}");
+
+            let _scope_guard = ScopeGuard(Some(|| {
+                let mut schema_txn_guard = schema_write_transaction_exclusivity.lock().unwrap();
+                schema_txn_guard.release(TransactionReservationKind::Write);
+                debug!("Finished updating statistics for database {}", database_name.as_str());
+            }));
+
+            let commit_deltas = {
+                let mut queue = commit_deltas_queue.write().unwrap();
+                let Some((&seq, _)) = queue.first_key_value() else { return };
+                if seq > new_statistics.sequence_number.next() {
+                    // waiting on commits between statistics and current front of the queue
+                    return;
+                }
+
+                let range_start = seq;
+                let range_end = queue
+                    .keys()
+                    .tuple_windows()
+                    .map_while(|(&prev, &cur)| (prev.next() == cur).then_some(cur))
+                    .last()
+                    .unwrap_or(range_start) // only one consecutive sequence number
+                    .next();
+                let tail = queue.split_off(&range_end);
+                mem::replace(&mut *queue, tail)
+            };
+
+            for commit_deltas in commit_deltas.into_values() {
+                if let Err(err) = new_statistics.update_deltas(&commit_deltas, storage.durability()) {
+                    error!("Statistics update failed: {err:?}");
+                    return;
+                }
+            }
+            let new_statistics = Arc::new(new_statistics);
+            query_cache.set_statistics(new_statistics.clone());
+            schema.write().unwrap().thing_statistics = new_statistics;
+        }
+    }
+}
+
+fn make_cleanup_fn(
+    database_name: String,
+    storage: Arc<MVCCStorage<WALClient>>,
+    schema: Arc<RwLock<Schema>>,
+    cleanup_queue: Arc<RwLock<BTreeMap<SequenceNumber, CleanupIntervals>>>,
+    cleanup_strategy: MvccCleanupStrategy,
+) -> impl Fn() {
+    fn make_disabled_cleanup_fn(
+        cleanup_queue: Arc<RwLock<BTreeMap<SequenceNumber, CleanupIntervals>>>,
+    ) -> Box<dyn Fn() + Send + Sync> {
+        Box::new(move || {
+            cleanup_queue.write().unwrap().clear();
+        })
+    }
+
+    fn make_eager_cleanup_fn(
+        database_name: String,
+        storage: Arc<MVCCStorage<WALClient>>,
+        schema: Arc<RwLock<Schema>>,
+        cleanup_queue: Arc<RwLock<BTreeMap<SequenceNumber, CleanupIntervals>>>,
+    ) -> Box<dyn Fn() + Send + Sync> {
+        Box::new(move || {
+            debug!("Running cleanup for database {}", database_name);
+            let start = std::time::Instant::now();
+            let statistics_watermark = schema.read().unwrap().thing_statistics.sequence_number;
+            let earliest_possible_reader = storage.earliest_possible_reader();
+            let watermark = SequenceNumber::min(statistics_watermark, earliest_possible_reader);
+
+            let range = {
+                let mut queue = cleanup_queue.write().unwrap();
+                let tail_including_watermark = queue.split_off(&watermark);
+                mem::replace(&mut *queue, tail_including_watermark)
+            };
+
+            let ranges = {
+                let contains_start = range.contains_key(&storage.earliest_uncleaned());
+                let contains_end = range.contains_key(&watermark.previous());
+                let all_consecutive = range.keys().tuple_windows().all(|(a, &b)| a.next() == b);
+                if contains_start && contains_end && all_consecutive {
+                    range.into_values().fold(CleanupIntervals::default(), CleanupIntervals::merge)
+                } else {
+                    info!("Missing delta records during cleanup; scanning database for dead keys.");
+                    CleanupIntervals::everything::<EncodingKeyspace>()
+                }
+            };
+
+            if let Err(error) = storage.mvcc_cleanup(watermark, ranges) {
+                error!("Cleanup failed: {:?}", error);
+            }
+            debug!("Finished cleanup for database {} in {:?}", database_name, start.elapsed());
+        })
+    }
+
+    match cleanup_strategy {
+        MvccCleanupStrategy::Disabled => make_disabled_cleanup_fn(cleanup_queue),
+        MvccCleanupStrategy::Eager => make_eager_cleanup_fn(database_name, storage, schema, cleanup_queue),
+    }
+}
+
+typedb_error! {
+    pub DatabaseOpenError(component = "Database open", prefix = "DBO") {
+        InvalidUnicodeName(1, "Could not open database: invalid unicode name '{name:?}'.", name: OsString),
+        DirectoryRead(2, "Error while reading directory for '{name}'.", name: String, source: Arc<io::Error>),
+        DirectoryCreate(3, "Error creating directory for '{name}'", name: String, source: Arc<io::Error>),
+        StorageOpen(4, "Error opening storage layer.", typedb_source: StorageOpenError),
+        WALOpen(5, "Error opening WAL.", source: DurabilityServiceError),
+        DurabilityClientOpen(6, "Error opening durability client.", typedb_source: DurabilityClientError),
+        DurabilityClientRead(7, "Error reading from durability client.", typedb_source: DurabilityClientError),
+        CheckpointLoad(8, "Error loading checkpoint for database '{name}'.", name: String, typedb_source: CheckpointLoadError),
+        CheckpointCreate(9, "Error creating checkpoint for database '{name}'.", name: String, source: CheckpointCreateError),
+        Encoding(10, "Data encoding error.", source: EncodingError),
+        StatisticsInitialise(11, "Error initialising statistics manager.", typedb_source: StatisticsError),
+        TypeCacheInitialise(12, "Error initialising type cache.", typedb_source: TypeCacheCreateError),
+        FunctionCacheInitialise(13, "Error initialising function cache.", typedb_source: FunctionError),
+        FileDelete(14, "Error while deleting file for '{name}'", name: String, source: Arc<io::Error>),
+        DirectoryDelete(15, "Error while deleting directory of '{name}'", name: String, source: Arc<io::Error>),
+        NotADatabase(16, "Directory '{name}' already exists and does not contain a database.", name: String),
+        PrepareForWrites(17, "Failed to prepare database '{name}' for writes. In-memory allocators may collide with storage on the next allocation.", name: String, source: EncodingError),
+    }
+}
+
+typedb_error! {
+    pub DatabaseCreateError(component = "Database create", prefix = "DBC") {
+        InvalidName(1, "Cannot create database since '{name}' is not a valid database name.", name: String),
+        InternalDatabaseCreationProhibited(2, "Creating an internal database is prohibited."),
+        DatabaseOpen(3, "Database open error.", typedb_source: DatabaseOpenError),
+        WriteAccessDenied(4, "Cannot access databases for writing."),
+        ReadAccessDenied(5, "Cannot access databases for reading."),
+        AlreadyExists(6, "Database '{name}' already exists.", name: String),
+        AlreadyExistsAndCleanupBlocked(7, "Database '{name}' already exists. Error while removing the imported duplicate.", name: String, typedb_source: DatabaseDeleteError),
+        IsBeingImported(8, "Cannot create database '{name}' since it is being imported.", name: String),
+        IsNotBeingImported(9, "Internal error: database '{name}' is not being imported.", name: String),
+        DirectoryWrite(10, "Error while writing to data directory for '{name}'.", name: String, source: Arc<io::Error>),
+        DatabaseMove(11, "Error while moving database {name} while finalization.", name: String),
+        ImportedDatabaseInUse(12, "Imported database '{name}' is still in use.", name: String),
+        ImportCleanupFailed(13, "Cannot prepare database '{name}' for import: removing the leftover of a previous import failed.", name: String, typedb_source: DatabaseDeleteError),
+    }
+}
+
+typedb_error! {
+    pub DatabaseCloseError(component = "Database close", prefix = "DCL") {
+        StatisticsPersist(1, "Error persisting statistics of database '{name}'.", name: String, typedb_source: StatisticsError),
+        CheckpointCreate(2, "Error creating checkpoint for database '{name}'.", name: String, source: CheckpointCreateError),
+    }
+}
+
+typedb_error! {
+    pub DatabaseDeleteError(component = "Database delete", prefix = "DBD") {
+        DoesNotExist(1, "Cannot delete database since it does not exist."),
+        InUse(2, "Cannot delete database since it is in use."),
+        StorageDelete(3, "Error while deleting storage resources.", typedb_source: StorageDeleteError),
+        DirectoryDelete(4, "Error deleting directory.", source: Arc<io::Error>),
+        InternalDatabaseDeletionProhibited(5, "Deleting an internal database is prohibited"),
+        WriteAccessDenied(6, "Cannot access databases for writing."),
+        DatabaseIsNotBeingImported(7, "Internal error: database '{name}' is not being imported.", name: String),
+    }
+}
+
+typedb_error! {
+    pub DatabaseResetError(component = "Database reset", prefix = "DBR") {
+        DatabaseDelete(1, "Cannot delete database.", typedb_source: DatabaseDeleteError),
+        DatabaseCreate(2, "Cannot create database.", typedb_source: DatabaseCreateError),
+        Transaction(3, "Transaction error.", typedb_source: TransactionError),
+        InUse(4, "Database cannot be reset since it is in use."),
+        StorageInUse(5, "Database cannot be reset since the storage is in use."),
+        CorruptionPartialResetStorageInUse(
+            6,
+            "Corruption warning: database reset failed partway because the storage is still in use.",
+            typedb_source: StorageResetError
+        ),
+        CorruptionPartialResetKeyGeneratorInUse(
+            7,
+            "Corruption warning: Database reset failed partway because the schema key generator is still in use."
+        ),
+        CorruptionPartialResetTypeVertexGeneratorInUse(
+            8,
+            "Corruption warning: Database reset failed partway because the type key generator is still in use."
+        ),
+        CorruptionPartialResetThingVertexGeneratorInUse(
+            9,
+            "Corruption warning: Database reset failed partway because the instance key generator is still in use."
+        ),
+        CorruptionPartialResetQuertyCacheInUse(
+            10,
+            "Corruption warning: Database reset failed partway because the query cache is still in use."
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use concept::thing::statistics::Statistics;
+    use diagnostics::{diagnostics_manager::DiagnosticsManager, metrics::FsyncMetrics};
+    use durability::wal::WAL;
+    use encoding::EncodingKeyspace;
+    use executor::ExecutionInterrupt;
+    use options::{MvccCleanupStrategy, QueryOptions, TransactionOptions, byte_size::ByteSize};
+    use query::given_rows::GivenRowsSimple;
+    use storage::{
+        durability_client::{DurabilityClient, WALClient},
+        keyspace::rocks_resources::RocksResources,
+        recovery::checkpoint::CheckpointReader,
+    };
+    use test_utils::{create_tmp_storage_dir, init_logging};
+
+    use crate::{
+        Database,
+        query::{execute_schema_query, execute_write_query_in_write},
+        transaction::{CommitIntent, TransactionSchema, TransactionWrite},
+    };
+
+    #[test]
+    fn checkpoint_and_close_leaves_nothing_to_recover() {
+        init_logging();
+        let tmp_dir = create_tmp_storage_dir();
+        let path = tmp_dir.as_ref().join("checkpoint-and-close");
+        let rocks_resources = RocksResources::new(ByteSize::mb(64), ByteSize::mb(64));
+        let database = Arc::new(
+            Database::<WALClient>::open(
+                &path,
+                &DiagnosticsManager::new_disabled(),
+                &rocks_resources,
+                MvccCleanupStrategy::Disabled,
+            )
+            .unwrap(),
+        );
+
+        let schema = "define entity person;";
+        let tx = TransactionSchema::open(database.clone(), TransactionOptions::default()).unwrap();
+        let schema_query = typeql::parse_query(schema).unwrap().into_structure().into_schema();
+        let (tx, result) = execute_schema_query(tx, schema_query, schema.to_string());
+        result.unwrap();
+        let (mut profile, intent) = tx.finalise();
+        intent.unwrap().commit(profile.commit_profile()).unwrap();
+
+        let insert = "insert $p isa person;";
+        let tx = TransactionWrite::open(database.clone(), TransactionOptions::default()).unwrap();
+        let pipeline = typeql::parse_query(insert).unwrap().into_structure().into_pipeline();
+        let (tx, result) = execute_write_query_in_write(
+            tx,
+            QueryOptions::default_grpc(),
+            Arc::new(pipeline),
+            None::<GivenRowsSimple>,
+            insert.to_string(),
+            ExecutionInterrupt::new_uninterruptible(),
+        );
+        result.unwrap();
+        let (mut profile, intent) = tx.finalise();
+        intent.unwrap().commit(profile.commit_profile()).unwrap();
+
+        Arc::into_inner(database).unwrap().checkpoint_and_close().unwrap();
+
+        let mut wal = WALClient::new(WAL::load(&path, FsyncMetrics::disabled()).unwrap());
+        wal.register_record_type::<Statistics>();
+        let last_sequence_number = wal.previous();
+        let checkpoint = CheckpointReader::open_latest::<EncodingKeyspace>(&path).unwrap().expect("checkpoint");
+        assert_eq!(checkpoint.read_metadata().unwrap().watermark, last_sequence_number);
+        let statistics = wal.find_last_unsequenced_type::<Statistics>().unwrap().expect("statistics record");
+        assert_eq!(statistics.sequence_number, last_sequence_number);
+    }
+}

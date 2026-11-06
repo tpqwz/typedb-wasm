@@ -1,0 +1,20 @@
+[package]
+name = "rocksdb"
+version = "0.25.0"
+edition = "2021"
+description = "In-memory stand-in for the rocksdb crate, so TypeDB can compile to WebAssembly."
+license = "Apache-2.0"
+
+[features]
+default = []
+bindgen-runtime = []
+lz4 = []
+multi-threaded-cf = []
+serde1 = []
+memfs = ["dep:durability"]
+
+[dependencies]
+durability = { path = "../../durability", optional = true }
+
+[workspace]
+

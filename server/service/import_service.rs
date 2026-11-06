@@ -1,0 +1,21 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+use database::migration::database_importer::DatabaseImportError;
+use error::typedb_error;
+
+use crate::error::ArcServerStateError;
+
+typedb_error! {
+    pub DatabaseImportServiceError(component = "Database import service", prefix = "DIS") {
+        DatabaseImport(1, "Error while importing the database's schema and data.", typedb_source: DatabaseImportError),
+        DuplicateImport(3, "Error importing '{name}': another import operation for database '{old_name}' was already initiated through this channel. It is a sign of a corrupted file or a client bug.", name: String, old_name: String),
+        ImportNotInitialised(4, "A migration item or completion request was received before the import was initialised. The initial request carrying the database name and schema must come first."),
+        ImportPrepareFailed(8, "The server could not open a database import for this request.", typedb_source: ArcServerStateError),
+        ImportClosed(10, "The import was closed by the server. The import is aborted and can be retried."),
+        ShutdownInterrupt(11, "The import was interrupted by server shutdown. The import is aborted and can be retried."),
+        ClientClosed(12, "The import stream was closed by the client before completion. The import is aborted and can be retried."),
+    }
+}

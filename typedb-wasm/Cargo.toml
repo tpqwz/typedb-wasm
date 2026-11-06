@@ -1,0 +1,28 @@
+[package]
+name = "typedb-wasm"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "WebAssembly entry to the TypeDB database crate, with the in-memory keyspace."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+answer = { workspace = true }
+wasm-bindgen = "0.2"
+concept = { workspace = true }
+database = { workspace = true, features = ["memfs"] }
+compiler = { workspace = true }
+diagnostics = { workspace = true }
+durability = { workspace = true, features = ["memfs"] }
+executor = { workspace = true }
+itertools = { workspace = true }
+ir = { workspace = true }
+lending_iterator = { workspace = true }
+options = { workspace = true }
+query = { workspace = true }
+resource = { workspace = true }
+storage = { workspace = true }
+typeql = { workspace = true }

@@ -1,0 +1,203 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+use std::collections::HashMap;
+
+use answer::variable::Variable;
+use encoding::graph::type_::Kind;
+use ir::{
+    pattern::{Vertex, conjunction::Conjunction, constraint::Constraint, nested_pattern::NestedPattern},
+    pipeline::{VariableRegistry, block::Block},
+};
+
+use crate::{
+    VariablePosition,
+    annotation::{
+        pipeline::collect_deleted_variables,
+        type_annotations::{BlockAnnotations, TypeAnnotations},
+    },
+    executable::{
+        WriteCompilationError, WritePatternCondition,
+        delete::instructions::{ConnectionInstruction, Has, Links, ThingInstruction},
+        insert::{
+            ThingPosition,
+            executable::{get_thing_position, resolve_links_roles},
+        },
+        next_executable_id,
+    },
+};
+
+#[derive(Debug)]
+pub struct DeleteExecutable {
+    pub executable_id: u64,
+    pub root_delete: ConditionalDelete,
+    pub output_row_schema: Vec<Option<Variable>>,
+    // pub debug_info: HashMap<VariableSource, Variable>,
+}
+
+pub fn compile(
+    input_variables: &HashMap<Variable, VariablePosition>,
+    block_annotations: &BlockAnnotations,
+    variable_registry: &VariableRegistry,
+    block: &Block,
+) -> Result<DeleteExecutable, Box<WriteCompilationError>> {
+    let root_delete =
+        ConditionalDelete::build_recursive(block.conjunction(), block_annotations, variable_registry, input_variables)?;
+
+    // To produce the output stream, we remove the deleted concepts from each map in the stream.
+    let deleted_variables_recursive = collect_deleted_variables(block);
+    let mut output_row_schema = Vec::new();
+    for (&variable, position) in input_variables {
+        if deleted_variables_recursive.contains(&variable) {
+            continue;
+        }
+        let pos_as_usize = position.as_usize();
+        if output_row_schema.len() <= pos_as_usize {
+            output_row_schema.resize(pos_as_usize + 1, None);
+        }
+        output_row_schema[pos_as_usize] = Some(variable);
+    }
+
+    Ok(DeleteExecutable { executable_id: next_executable_id(), root_delete, output_row_schema })
+}
+
+#[derive(Debug)]
+pub struct ConditionalDelete {
+    pub condition: WritePatternCondition,
+    pub concept_instructions: Vec<ThingInstruction>,
+    pub connection_instructions: Vec<ConnectionInstruction>,
+    pub nested_deletes: Vec<ConditionalDelete>,
+}
+
+impl ConditionalDelete {
+    fn build_recursive(
+        conjunction: &Conjunction,
+        block_annotations: &BlockAnnotations,
+        variable_registry: &VariableRegistry,
+        input_variables: &HashMap<Variable, VariablePosition>,
+    ) -> Result<Self, Box<WriteCompilationError>> {
+        let conjunction_annotations =
+            block_annotations.type_annotations_of(conjunction).expect("delete conjunction must have type annotations");
+
+        let concept_instructions =
+            add_concept_deletes(conjunction, conjunction_annotations, input_variables, variable_registry)?;
+
+        let connection_instructions =
+            add_connection_deletes(conjunction, conjunction_annotations, input_variables, variable_registry)?;
+        let condition = WritePatternCondition::build(conjunction, input_variables, conjunction_annotations);
+
+        let nested_deletes = conjunction
+            .nested_patterns()
+            .iter()
+            .map(|nested| {
+                let NestedPattern::Optional(optional) = nested else {
+                    unreachable!("Only optionals are allowed as nested patterns in deletes")
+                };
+                Self::build_recursive(optional.conjunction(), block_annotations, variable_registry, input_variables)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { condition, concept_instructions, connection_instructions, nested_deletes })
+    }
+}
+
+fn add_concept_deletes(
+    conjunction: &Conjunction,
+    conjunction_annotations: &TypeAnnotations,
+    input_variables: &HashMap<Variable, VariablePosition>,
+    variable_registry: &VariableRegistry,
+) -> Result<Vec<ThingInstruction>, Box<WriteCompilationError>> {
+    let mut concept_instructions = Vec::new();
+    for constraint in conjunction.constraints().iter().filter_map(|c| c.as_delete_concepts()) {
+        for variable in constraint.ids() {
+            let Some(input_position) = input_variables.get(&variable) else {
+                return Err(Box::new(WriteCompilationError::DeletedThingWasNotInInput {
+                    variable: variable_registry.get_variable_name_or_unnamed(variable).to_owned(),
+                    source_span: constraint.source_span(),
+                }));
+            };
+            assert!(conjunction_annotations.concept_annotations_of(&Vertex::Variable(variable)).is_some());
+            if conjunction_annotations
+                .concept_annotations_of(&Vertex::Variable(variable))
+                .is_some_and(|anno| anno.iter().any(|type_| type_.kind() == Kind::Role))
+            {
+                return Err(Box::new(WriteCompilationError::DeleteIllegalRoleVariable {
+                    variable: variable_registry.get_variable_name_or_unnamed(variable).to_owned(),
+                    source_span: constraint.source_span(),
+                }));
+            } else {
+                concept_instructions.push(ThingInstruction { thing: ThingPosition(*input_position) });
+            };
+        }
+    }
+    Ok(concept_instructions)
+}
+
+fn add_connection_deletes(
+    conjunction: &Conjunction,
+    block_annotations: &TypeAnnotations,
+    input_variables: &HashMap<Variable, VariablePosition>,
+    variable_registry: &VariableRegistry,
+) -> Result<Vec<ConnectionInstruction>, Box<WriteCompilationError>> {
+    let resolved_roles = resolve_links_roles(conjunction, block_annotations, input_variables, variable_registry)?;
+    let mut connection_deletes = Vec::new();
+    for constraint in conjunction.constraints() {
+        match constraint {
+            Constraint::Has(has) => {
+                connection_deletes.push(ConnectionInstruction::Has(Has {
+                    owner: get_thing_position(
+                        input_variables,
+                        has.owner().as_variable().unwrap(),
+                        variable_registry,
+                        has.source_span(),
+                    )?,
+                    attribute: get_thing_position(
+                        input_variables,
+                        has.attribute().as_variable().unwrap(),
+                        variable_registry,
+                        has.source_span(),
+                    )?,
+                }));
+            }
+            Constraint::Links(links) => {
+                let relation = get_thing_position(
+                    input_variables,
+                    links.relation().as_variable().unwrap(),
+                    variable_registry,
+                    links.source_span(),
+                )?;
+                let player = get_thing_position(
+                    input_variables,
+                    links.player().as_variable().unwrap(),
+                    variable_registry,
+                    links.source_span(),
+                )?;
+                let role = resolved_roles.get(&links.role_type().as_variable().unwrap()).unwrap().clone();
+                connection_deletes.push(ConnectionInstruction::Links(Links { relation, player, role }));
+            }
+            Constraint::LinksDeduplication(_) | Constraint::RoleName(_) => (), // Ignore. It will have done its job during type-inference
+            Constraint::DeleteConcepts(_) => (),                               // Is a ConceptInstruction
+            Constraint::IsSet(_) => (),
+            Constraint::Iid(_)
+            | Constraint::Isa(_)
+            | Constraint::Kind(_)
+            | Constraint::Label(_)
+            | Constraint::Owns(_)
+            | Constraint::Relates(_)
+            | Constraint::Plays(_)
+            | Constraint::ExpressionBinding(_)
+            | Constraint::Is(_)
+            | Constraint::Comparison(_)
+            | Constraint::Sub(_)
+            | Constraint::Value(_)
+            | Constraint::FunctionCallBinding(_)
+            | Constraint::IndexedRelation(_)
+            | Constraint::Unsatisfiable(_) => {
+                unreachable!()
+            }
+        }
+    }
+    Ok(connection_deletes)
+}
