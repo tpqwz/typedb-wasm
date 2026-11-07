@@ -2,7 +2,7 @@
 
 WebAssembly entry to TypeDB, the one Hyperbase runs in the browser.
 
-This crate sits in a modified TypeDB tree. The base is TypeDB `45dbd86` (VERSION 3.14.2). TypeQL is the checkout `d07e949` (VERSION 3.14.0). The protocol checkout used by the build is `a247524`. The license of TypeDB, and of this crate, is MPL-2.0. See `LICENSE` at the root of the tree.
+This crate sits in a modified TypeDB tree. The base is TypeDB `45dbd86` (VERSION 3.14.2). TypeQL is the checkout `d07e949` (VERSION 3.14.0). The protocol checkout used by the build is `a247524`. The license of TypeDB, and of this crate, is MPL-2.0. See `LICENSE` and `NOTICE.md` at the root of the tree. This is not an official TypeDB release.
 
 `query(name, typeql)` runs one statement, or several separated by `end;`. It stops at the first error and keeps the answers from statements that already committed. `save` and `restore` move the in-memory log. The keyspace is memory (`memfs`). There is no disk database.
 

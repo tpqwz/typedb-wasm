@@ -1,3 +1,8 @@
+// Modified excerpt of library/std/src/sys/time/unsupported.rs from the Rust
+// project. Copyright the Rust project developers. Dual-licensed under the
+// MIT license and the Apache License, Version 2.0. The change is the pair of
+// clock imports below. This file is not part of the MPL-2.0 TypeDB tree.
+
 use crate::time::Duration;
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]

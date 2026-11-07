@@ -1,3 +1,5 @@
+> This is not the TypeDB project. It is an unaffiliated WebAssembly port of TypeDB 3.14.2 (`45dbd86`), published so the module Hyperbase runs can be built from source. The license is MPL-2.0. Read [NOTICE.md](NOTICE.md) before the upstream introduction below. Upstream: <https://github.com/typedb/typedb>
+
 [![TypeDB](https://github.com/typedb/.github/raw/master/profile/banner.png)](https://typedb.com/)
 
 [![Factory](https://factory.vaticle.com/api/status/typedb/typedb/badge.svg)](https://factory.vaticle.com/typedb/typedb)
